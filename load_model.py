@@ -109,30 +109,21 @@ def load_saved_model(load_path, device):
         return torch.load(load_path, map_location=torch.device('cuda'))
 
 
-# In[7]: Freeze everything except output layer
-def freeze(model, model_name):
-    count = 0
-    if model_name == 'vgg16':
-        for param in model.parameters():
-            if count == 30:
-                param.requires_grad = True
-            else:
-                param.requires_grad = False
-        count = count + 1
-
-    if model_name == 'vgg13':
-        for param in model.parameters():
-            if count == 24:
-                param.requires_grad = True
-            else:
-                param.requires_grad = False
-
-    if model_name == 'vgg11':
-        for param in model.parameters():
-            if count == 20:
-                param.requires_grad = True
-            else:
-                param.requires_grad = False
+# In[7]: Freeze everything except the final classifier layer.
+# Previously this picked the layer to unfreeze by a hardcoded parameter
+# *position* (e.g. count == 30 for vgg16), a count derived for the
+# non-batchnorm architecture. Every caller in this codebase actually passes
+# in a batch_norm=True model (extra BatchNorm weight/bias parameters shift
+# every position after the first conv layer), so that position never lined
+# up with the intended layer, and only ever matched requires_grad on the
+# final layer's weight, never its bias. Targeting classifier[-1] by name
+# instead works for any VGG depth/variant and freezes/unfreezes both its
+# weight and bias.
+def freeze(model, model_name=None):
+    for param in model.parameters():
+        param.requires_grad = False
+    for param in model.classifier[-1].parameters():
+        param.requires_grad = True
 
 
 # In[8]: freeze weights of convolution layer

@@ -4,74 +4,35 @@
 # In[1]:
 import torch
 
-# In[2]:
-def compute_saliency_score_channel(tensor_t, n=1, dim_to_keep=[0], prune_amount=1):
-    INF = 10000.0
-    dim_to_prune = list(range(tensor_t.dim()))
-    for i in range(len(dim_to_keep)):
-        dim_to_prune.remove(dim_to_keep[i])
+# In[2]: Channel (filter) importance by weight-magnitude criterion.
+# Ranks each output channel of a conv layer by its Lp-norm and returns the
+# indices of the `prune_amount` least-salient (smallest-norm) channels,
+# weakest first. This is the standard magnitude/saliency pruning criterion
+# (cf. Li et al., "Pruning Filters for Efficient ConvNets").
+def compute_saliency_score_channel(tensor_t, n=1, prune_amount=1):
+    out_channels = tensor_t.shape[0]
+    prune_amount = max(0, min(prune_amount, out_channels - 1))
+    channel_norm = torch.norm(tensor_t.reshape(out_channels, -1), p=n, dim=1)
+    order = torch.argsort(channel_norm)
+    return order[:prune_amount].tolist()
 
-    size = tensor_t.shape
-    print(size)
-    print(dim_to_keep)
-    channel_norm = torch.norm(tensor_t, p=1, dim=dim_to_prune)
-    channel_norm_temp = torch.norm(tensor_t, p=1, dim=dim_to_prune)
-    
-    for i in range(size[0]):
-        max1=max2=max3=0
-        channel_norm[i] = 0
-        for j in range(size[1]):
-            for kh in range(size[2]):
-                for kw in range(size[2]):
-                    if abs(tensor_t[i][j][kh][kw]) > max3:
-                        max3=abs(tensor_t[i][j][kh][kw])
-                        if max3 > max1:
-                            tempvar = max3
-                            max3=max2
-                            max2=max1
-                            max1=tempvar
-            channel_norm[i] += max1+max2+max3  
-    
-    score_value = []
 
-    for i in range(prune_amount):
-        min_idx = 0
-        for j in range(size[0]):
-            if channel_norm_temp[min_idx] > channel_norm_temp[j]:
-                min_idx = j
-        score_value.append([min_idx, channel_norm[min_idx]])
-        channel_norm_temp[min_idx] = INF
-
-    return score_value
-
-# In[3]:
-def compute_distance_score_channel(tensor_t, n=1, dim_to_keep=[0, 1], prune_amount=1):
-    size = tensor_t.shape
-    scale_tensor = torch.zeros_like(tensor_t)
-    dist_score_channel = []
-    for i in range(size[0]):
-        scale_tensor = tensor_t[i]/torch.norm(tensor_t[[i]])
-    max_val = 0
-    max_idx = 0
-    for i1 in range(size[0]):
-        for i2 in range(i1+1, size[0]):
-            score_val = torch.norm(scale_tensor[i1]-scale_tensor[i2])
-            if len(dist_score_channel) < prune_amount:
-                dist_score_channel.append([i1, i2, score_val])
-                if max_val < score_val:
-                    max_val = score_val
-                    max_idx = len(dist_score_channel)-1
-            else:
-                if score_val < max_val:
-                    dist_score_channel[max_idx] = [i1, i2, score_val]
-                    max_val = dist_score_channel[0][2]
-                    max_idx = 0
-                    for prune_amount in range(1, len(dist_score_channel)):
-                        if max_val < dist_score_channel[prune_amount][2]:
-                            max_val = dist_score_channel[prune_amount][2]
-                            max_idx = prune_amount
-
-    return dist_score_channel
+# In[3]: Channel (filter) importance by redundancy criterion.
+# Normalizes every output channel to unit norm, computes pairwise distance
+# between channels, and returns the indices of the `prune_amount` channels
+# that are closest to some other channel in the layer (i.e. most redundant /
+# most "similar" to another surviving channel), most redundant first.
+def compute_distance_score_channel(tensor_t, n=1, prune_amount=1):
+    out_channels = tensor_t.shape[0]
+    prune_amount = max(0, min(prune_amount, out_channels - 1))
+    flat = tensor_t.reshape(out_channels, -1)
+    norms = torch.norm(flat, p=2, dim=1, keepdim=True).clamp_min(1e-12)
+    normalized = flat / norms
+    dist = torch.cdist(normalized, normalized, p=n)
+    dist.fill_diagonal_(float('inf'))
+    nearest_dist, _ = torch.min(dist, dim=1)
+    order = torch.argsort(nearest_dist)
+    return order[:prune_amount].tolist()
 
 
 # In[3]:
@@ -186,18 +147,51 @@ def deep_copy_kernelwise(destination_model, source_model):
                         j = j + 1
 
 
-# In[7]
+# In[7]: Copy surviving (non-zeroed) output channels of each pruned conv
+# layer in source_model into the smaller destination_model, in order.
+#
+# Because pruning a layer zeroes out entire output channels (filters), the
+# NEXT conv layer's input-channel dimension must be sliced using the same
+# surviving-channel indices its predecessor kept -- otherwise the copied
+# weight tensor's input dimension (still full-size in source_model) will not
+# match destination_model's already-shrunk input dimension. The previous
+# version of this function ignored that, copying the full input-channel
+# slice unmodified, which raises a shape-mismatch error for every conv layer
+# beyond the first. BatchNorm parameters (weight/bias/running stats), which
+# are also indexed per output-channel, are copied the same way; skipping
+# them (as before) meant every fine-tuning run started from freshly
+# re-initialized BatchNorm statistics instead of the trained ones.
 def deep_model_copy_channelwise(source_model, destination_model, feature_list):
-    for l in range(len(source_model.features)):
-        if str(source_model.features[l]).find('Conv') != -1:
-            size_org = source_model.features[l]._parameters['weight'].shape
-            #size_new = destination_model.features[l]._parameters['weight'].shape
-            out_ch_new =0
-            for out_ch_old in range(size_org[0]):
-                if torch.norm(source_model.features[l]._parameters['weight'][out_ch_old] != 0):
-                    t = source_model.features[l]._parameters['weight'][out_ch_old]
-                    destination_model.features[l]._parameters['weight'][out_ch_new] = t
-                    out_ch_old +=1
-                
+    prev_surviving_in = None  # channel indices kept by the previous conv layer
+    with torch.no_grad():
+        for l in range(len(source_model.features)):
+            layer_str = str(source_model.features[l])
+            if layer_str.find('Conv') != -1:
+                src_weight = source_model.features[l]._parameters['weight']
+                dst_weight = destination_model.features[l]._parameters['weight']
+                src_bias = source_model.features[l]._parameters.get('bias')
+                dst_bias = destination_model.features[l]._parameters.get('bias')
+
+                out_org = src_weight.shape[0]
+                surviving_out = [o for o in range(out_org) if torch.norm(src_weight[o]) != 0]
+
+                for new_o, old_o in enumerate(surviving_out):
+                    src_slice = src_weight[old_o]
+                    if prev_surviving_in is not None:
+                        src_slice = src_slice[prev_surviving_in]
+                    dst_weight[new_o] = src_slice
+                    if src_bias is not None and dst_bias is not None:
+                        dst_bias[new_o] = src_bias[old_o]
+
+                prev_surviving_in = surviving_out
+            elif layer_str.find('BatchNorm') != -1 and prev_surviving_in is not None:
+                src_bn = source_model.features[l]
+                dst_bn = destination_model.features[l]
+                for new_o, old_o in enumerate(prev_surviving_in):
+                    dst_bn.weight[new_o] = src_bn.weight[old_o]
+                    dst_bn.bias[new_o] = src_bn.bias[old_o]
+                    dst_bn.running_mean[new_o] = src_bn.running_mean[old_o]
+                    dst_bn.running_var[new_o] = src_bn.running_var[old_o]
+
 
 # In[]

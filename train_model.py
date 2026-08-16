@@ -94,13 +94,10 @@ value to perform final fine tuning.
 
 # evaluate model on given dataset using given data loader
 @torch.no_grad()
-# evaluate model on given dataset using given data loader
 def evaluate(model, data_loader):
     model.eval()
-    with torch.no_grad():
-        for batch_X, batch_y in data_loader:
-            outputs = [compute_batch_loss_acc(model, batch_X, batch_y)]
-        return accumulate_batch_loss_acc(outputs)
+    outputs = [compute_batch_loss_acc(model, batch_X, batch_y) for batch_X, batch_y in data_loader]
+    return accumulate_batch_loss_acc(outputs)
 
 
 # Use special scheduler to change the value of learning rate
@@ -140,11 +137,11 @@ def fit_one_cycle(dataloaders, train_dir, test_dir,
             for batch_X, batch_y in dataloaders[train_dir]:
                 # compute the training loss of current batch
                 loss = compute_batch_loss(model, batch_X, batch_y)
-                l1_crit = nn.L1Loss()
-                reg_loss = 0
-                for param in model.parameters():
-                    reg_loss += l1_crit(param, target=torch.zeros_like(param))
-                loss += L1 * reg_loss
+                if L1:
+                    l1_crit = nn.L1Loss()
+                    reg_loss = sum(l1_crit(param, target=torch.zeros_like(param))
+                                  for param in model.parameters() if param.requires_grad)
+                    loss = loss + L1 * reg_loss
 
                 train_losses.append(loss)
                 loss.backward()  # compute the gradient of all weights
@@ -158,17 +155,14 @@ def fit_one_cycle(dataloaders, train_dir, test_dir,
                 # Record & update learning rate
                 lrs.append(get_lr(optimizer))
                 lr_scheduler.step()  # Update the learning rate
-                # Compute Validation Loss and Validation Accuracy
-                result = evaluate(model, dataloaders[test_dir])
-                # Compute Train Loss of whole epoch i.e. mean of loss of batch
-                result['train_loss'] = torch.stack(train_losses).mean().item()
-                # Observe how learning rate is change by schedular
-                result['lrs'] = lrs
-                # print the observation of each epoch in a proper format
 
-            # str_result = "Epoch [{}], last_lr: {:.5f}, train_loss: {:.4f}, val_loss: {:.4f},
-            # val_acc: {:.4f}".format(epoch, result['lrs'][-1],
-            # result['train_loss'], result['val_loss'], result['val_acc'])
+            # Compute Validation Loss and Validation Accuracy once per epoch (not per batch)
+            result = evaluate(model, dataloaders[test_dir])
+            # Compute Train Loss of whole epoch i.e. mean of loss of batch
+            result['train_loss'] = torch.stack(train_losses).mean().item()
+            # Observe how learning rate is change by schedular
+            result['lrs'] = lrs
+            # print the observation of each epoch in a proper format
             str_result = epoch_end(epoch, result)
 
             f.write(f"{model_name}-\t{str_result}\n")
