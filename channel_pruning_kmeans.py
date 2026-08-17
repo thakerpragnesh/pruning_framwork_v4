@@ -1,17 +1,22 @@
 #!/usr/bin/env python
 # coding: utf-8
 """
-Iterative structured channel (filter) pruning using a redundancy /
-similarity criterion: in each conv layer, the output channels that are
-closest (by normalized distance) to some other channel are considered
-redundant and are pruned first. Each round prunes the *current* (already
-pruned + fine-tuned) model, then fine-tunes the resulting smaller network,
-so pruning decisions in round N+1 are based on the weights actually trained
-in round N.
+Iterative structured channel (filter) pruning using a K-means redundancy
+criterion: in each conv layer, output channels are clustered by similarity
+and, within each cluster, every channel except the largest-L1-norm one is
+considered redundant and pruned (see
+facilitate_pruning.compute_kmeans_similarity_score_channel). The distance
+metric used for clustering is configurable via config.ini's
+[Pruning] distance_metric (manhattan/euclidean/cosine); manhattan was the
+best-performing metric in evaluation. Each round prunes the *current*
+(already pruned + fine-tuned) model, then fine-tunes the resulting smaller
+network, so pruning decisions in round N+1 are based on the weights
+actually trained in round N.
 """
 
 # In[1]: Import all the required modules
 import configparser
+import functools
 import os
 from datetime import date
 
@@ -46,6 +51,7 @@ max_lr = config.getfloat('Pruning', 'max_lr')
 weight_decay = config.getfloat('Pruning', 'weight_decay')
 l1_lambda = config.getfloat('Pruning', 'l1_lambda')
 grad_clip = config.getfloat('Pruning', 'grad_clip')
+distance_metric = config.get('Pruning', 'distance_metric', fallback='manhattan')
 
 # In[3]: Paths
 dataset_dir = f"{dir_home_path}Dataset/"
@@ -102,8 +108,13 @@ else:
                                   pretrainval=is_transfer_learning,
                                   freeze_feature_arg=False, device_l=device1)
 
+# In[7]: Bind the configured distance metric so the function matches the
+# score_fn(weight, prune_amount=k) contract every other criterion uses.
+kmeans_score_fn = functools.partial(
+    fp.compute_kmeans_similarity_score_channel, distance=distance_metric)
 
-# In[7]: Bundle everything prune_one_round needs for every round of this run.
+
+# In[8]: Bundle everything prune_one_round needs for every round of this run.
 round_kwargs = dict(
     max_pruning_ratio=max_pruning_ratio, fine_tune_epochs=fine_tune_epochs,
     max_lr=max_lr, weight_decay=weight_decay, l1_lambda=l1_lambda, grad_clip=grad_clip,
@@ -116,4 +127,4 @@ round_kwargs = dict(
 
 if __name__ == '__main__':
     current_model = pd.iterative_channel_pruning(
-        current_model, prune_epochs, fp.compute_distance_score_channel, **round_kwargs)
+        current_model, prune_epochs, kmeans_score_fn, **round_kwargs)

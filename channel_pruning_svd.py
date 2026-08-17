@@ -1,13 +1,15 @@
 #!/usr/bin/env python
 # coding: utf-8
 """
-Iterative structured channel (filter) pruning using a redundancy /
-similarity criterion: in each conv layer, the output channels that are
-closest (by normalized distance) to some other channel are considered
-redundant and are pruned first. Each round prunes the *current* (already
-pruned + fine-tuned) model, then fine-tunes the resulting smaller network,
-so pruning decisions in round N+1 are based on the weights actually trained
-in round N.
+Iterative structured channel (filter) pruning using a Singular Value
+Decomposition (SVD) saliency criterion: in each conv layer, every output
+channel's weight slice is reshaped to a 2D matrix and decomposed, and
+channels whose singular values sum to the least "energy" are considered
+least important and pruned first (see
+facilitate_pruning.compute_svd_saliency_score_channel). Each round prunes
+the *current* (already pruned + fine-tuned) model, then fine-tunes the
+resulting smaller network, so pruning decisions in round N+1 are based on
+the weights actually trained in round N.
 """
 
 # In[1]: Import all the required modules
@@ -116,4 +118,4 @@ round_kwargs = dict(
 
 if __name__ == '__main__':
     current_model = pd.iterative_channel_pruning(
-        current_model, prune_epochs, fp.compute_distance_score_channel, **round_kwargs)
+        current_model, prune_epochs, fp.compute_svd_saliency_score_channel, **round_kwargs)

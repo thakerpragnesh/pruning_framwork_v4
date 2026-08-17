@@ -1,17 +1,27 @@
 #!/usr/bin/env python
 # coding: utf-8
 """
-Iterative structured channel (filter) pruning using a redundancy /
-similarity criterion: in each conv layer, the output channels that are
-closest (by normalized distance) to some other channel are considered
-redundant and are pruned first. Each round prunes the *current* (already
-pruned + fine-tuned) model, then fine-tunes the resulting smaller network,
-so pruning decisions in round N+1 are based on the weights actually trained
-in round N.
+Hybrid structured channel pruning: chains different pruning criteria across
+rounds instead of applying the same one repeatedly, since a stronger
+saliency criterion and a redundancy/similarity criterion tend to catch
+different kinds of prunable channels. Each round prunes the *current*
+(already pruned + fine-tuned) model with whichever criterion the active
+stage specifies, then fine-tunes the resulting smaller network, so pruning
+decisions in round N+1 are based on the weights actually trained in round N
+-- exactly like the single-criterion scripts, just with `score_fn` allowed
+to change between rounds (see pruning_driver.hybrid_channel_pruning).
+
+The stage sequence below (4 rounds of Max3 saliency, then 3 rounds of
+K-means similarity) substitutes for the thesis's best-found sequence ("4x
+L1 saliency-channel -> 3x L1 similarity-channel -> 1x L1 saliency-kernel"):
+Max3 stands in for plain L1 saliency since it was the stronger channel-level
+saliency scorer, and the trailing kernel-level stage is dropped since
+kernel-level pruning is out of scope for this framework right now.
 """
 
 # In[1]: Import all the required modules
 import configparser
+import functools
 import os
 from datetime import date
 
@@ -46,6 +56,7 @@ max_lr = config.getfloat('Pruning', 'max_lr')
 weight_decay = config.getfloat('Pruning', 'weight_decay')
 l1_lambda = config.getfloat('Pruning', 'l1_lambda')
 grad_clip = config.getfloat('Pruning', 'grad_clip')
+distance_metric = config.get('Pruning', 'distance_metric', fallback='manhattan')
 
 # In[3]: Paths
 dataset_dir = f"{dir_home_path}Dataset/"
@@ -102,18 +113,26 @@ else:
                                   pretrainval=is_transfer_learning,
                                   freeze_feature_arg=False, device_l=device1)
 
+# In[7]: The hybrid stage sequence: (score_fn, num_rounds) pairs, run in
+# order, with the shrinking model carried forward across stages.
+kmeans_score_fn = functools.partial(
+    fp.compute_kmeans_similarity_score_channel, distance=distance_metric)
 
-# In[7]: Bundle everything prune_one_round needs for every round of this run.
+stages = [
+    (fp.compute_max3_saliency_score_channel, 4),
+    (kmeans_score_fn, 3),
+]
+
+# In[8]: Bundle everything prune_one_round needs for every round of this run.
 round_kwargs = dict(
     max_pruning_ratio=max_pruning_ratio, fine_tune_epochs=fine_tune_epochs,
     max_lr=max_lr, weight_decay=weight_decay, l1_lambda=l1_lambda, grad_clip=grad_clip,
     opt_func=opt_func, dataloaders=dataLoaders, train_dir=dl.train_directory,
     test_dir=dl.test_directory, device=device1, model_name='vgg16bn',
     log_fn=log, log_file=logResultFile, out_file=outFile, model_dir=model_dir,
-    save_prefix='vgg16_IntelIc_Prune',
+    save_prefix='vgg16_IntelIc_Prune_hybrid',
 )
 
 
 if __name__ == '__main__':
-    current_model = pd.iterative_channel_pruning(
-        current_model, prune_epochs, fp.compute_distance_score_channel, **round_kwargs)
+    current_model = pd.hybrid_channel_pruning(current_model, stages, **round_kwargs)

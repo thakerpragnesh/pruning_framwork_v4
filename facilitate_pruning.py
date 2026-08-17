@@ -35,6 +35,114 @@ def compute_distance_score_channel(tensor_t, n=1, prune_amount=1):
     return order[:prune_amount].tolist()
 
 
+# In[3b]: Channel importance by "Max3" saliency criterion (thesis Ch. 4.3).
+# For each output channel, for every input-channel kernel slice, take the 3
+# largest-magnitude weights and sum them; sum those per-kernel scores across
+# all input channels to get the channel's saliency score. Rationale: a
+# channel's most discriminative signal is assumed to be carried by each
+# kernel's few strongest activations rather than its overall magnitude, so
+# this can rank a channel highly even when its plain L1 norm is unremarkable.
+def compute_max3_saliency_score_channel(tensor_t, prune_amount=1):
+    out_channels, in_channels = tensor_t.shape[0], tensor_t.shape[1]
+    prune_amount = max(0, min(prune_amount, out_channels - 1))
+    flat = tensor_t.reshape(out_channels, in_channels, -1).abs()
+    k = min(3, flat.shape[-1])
+    channel_score = flat.topk(k, dim=-1).values.sum(dim=(-1, -2))
+    order = torch.argsort(channel_score)
+    return order[:prune_amount].tolist()
+
+
+# In[3c]: Channel importance via Singular Value Decomposition (thesis
+# Ch. 4.5). Each output channel's weight slice (in_channels x kh x kw) is
+# reshaped to a 2D matrix (in_channels x kh*kw); its singular values are
+# summed to get a single "energy" score for that channel -- channels whose
+# kernels carry less total energy across their singular directions are
+# pruned first. Batched via torch.linalg.svdvals so every channel in the
+# layer is decomposed in one call.
+def compute_svd_saliency_score_channel(tensor_t, prune_amount=1):
+    out_channels, in_channels = tensor_t.shape[0], tensor_t.shape[1]
+    prune_amount = max(0, min(prune_amount, out_channels - 1))
+    flat = tensor_t.reshape(out_channels, in_channels, -1)
+    singular_values = torch.linalg.svdvals(flat)
+    channel_score = singular_values.sum(dim=-1)
+    order = torch.argsort(channel_score)
+    return order[:prune_amount].tolist()
+
+
+# In[3d]: Channel importance via K-means redundancy clustering (thesis
+# Ch. 5.2/6.2). Flattens each output channel to a feature vector, clusters
+# them into (out_channels - prune_amount) groups using the given distance
+# metric, keeps the largest-L1-norm channel from each cluster, and marks the
+# rest for pruning -- channels that are similar to some other surviving
+# channel are considered redundant. `distance` selects the metric used only
+# for the cluster-assignment step (centroids are still updated by mean):
+# 'manhattan' (L1, the best-performing metric in the thesis), 'euclidean',
+# or 'cosine'.
+def _pairwise_distance(a, b, distance='manhattan'):
+    if distance == 'euclidean':
+        return torch.cdist(a, b, p=2)
+    if distance == 'manhattan':
+        return torch.cdist(a, b, p=1)
+    if distance == 'cosine':
+        a_n = torch.nn.functional.normalize(a, dim=-1)
+        b_n = torch.nn.functional.normalize(b, dim=-1)
+        return 1 - a_n @ b_n.t()
+    raise ValueError(f"Unknown distance metric: {distance!r}")
+
+
+def _kmeans_cluster_channels(features, k, distance='manhattan', iters=25):
+    n = features.shape[0]
+    k = max(1, min(k, n))
+    centroids = features[torch.randperm(n)[:k]].clone()
+
+    assignments = torch.full((n,), -1, dtype=torch.long)
+    for it in range(iters):
+        dist = _pairwise_distance(features, centroids, distance=distance)
+        new_assignments = torch.argmin(dist, dim=1)
+        converged = it > 0 and torch.equal(new_assignments, assignments)
+        assignments = new_assignments
+        if converged:
+            break
+
+        for c in range(k):
+            members = features[assignments == c]
+            if len(members) > 0:
+                centroids[c] = members.mean(dim=0)
+            else:
+                # Re-seed an empty cluster from a random point so it has a
+                # chance to pick up a member (a point at distance 0 from its
+                # own value) on the next assignment step.
+                centroids[c] = features[torch.randint(0, n, (1,))].squeeze(0)
+    return assignments
+
+
+def compute_kmeans_similarity_score_channel(tensor_t, prune_amount=1, distance='manhattan'):
+    out_channels = tensor_t.shape[0]
+    prune_amount = max(0, min(prune_amount, out_channels - 1))
+    if prune_amount == 0:
+        return []
+    k = out_channels - prune_amount
+
+    flat = tensor_t.reshape(out_channels, -1)
+    channel_norm = torch.norm(flat, p=1, dim=1)
+    assignments = _kmeans_cluster_channels(flat, k, distance=distance)
+
+    prune_indices = []
+    for c in range(k):
+        members = (assignments == c).nonzero(as_tuple=True)[0]
+        if len(members) == 0:
+            continue
+        keep_idx = members[torch.argmax(channel_norm[members])].item()
+        prune_indices.extend(m for m in members.tolist() if m != keep_idx)
+
+    # A cluster can end up empty (all candidate points reassigned elsewhere
+    # before convergence), which would prune more than `prune_amount`
+    # channels since no representative survives for it. Guard by keeping
+    # only the `prune_amount` weakest (smallest-norm) candidates.
+    prune_indices.sort(key=lambda idx: channel_norm[idx].item())
+    return prune_indices[:prune_amount]
+
+
 # In[3]:
 def compute_saliency_score_kernel(tensor_t, n=1, dim_to_keep=[0, 1], prune_amount=1):
     # dims = all axes, except for the one identified by `dim`
@@ -161,6 +269,14 @@ def deep_copy_kernelwise(destination_model, source_model):
 # are also indexed per output-channel, are copied the same way; skipping
 # them (as before) meant every fine-tuning run started from freshly
 # re-initialized BatchNorm statistics instead of the trained ones.
+#
+# The assertions below are deliberate: this function's correctness was never
+# actually confirmed during the original (week-long, V100) training runs --
+# a shape mismatch here fails loudly and immediately rather than silently,
+# so if `feature_list` bookkeeping and the actual surviving-channel count
+# ever diverge again, the very next run says so on round 1 instead of
+# quietly copying/training on a model that doesn't mean what its recorded
+# parameter/FLOPs counts claim.
 def deep_model_copy_channelwise(source_model, destination_model, feature_list):
     prev_surviving_in = None  # channel indices kept by the previous conv layer
     with torch.no_grad():
@@ -175,10 +291,20 @@ def deep_model_copy_channelwise(source_model, destination_model, feature_list):
                 out_org = src_weight.shape[0]
                 surviving_out = [o for o in range(out_org) if torch.norm(src_weight[o]) != 0]
 
+                assert len(surviving_out) == dst_weight.shape[0], (
+                    f"deep_model_copy_channelwise: layer {l} has {len(surviving_out)} "
+                    f"surviving (non-zero) channels in source_model, but destination_model "
+                    f"was built expecting {dst_weight.shape[0]} -- feature_list bookkeeping "
+                    f"and the actual pruned-channel count have diverged.")
+
                 for new_o, old_o in enumerate(surviving_out):
                     src_slice = src_weight[old_o]
                     if prev_surviving_in is not None:
                         src_slice = src_slice[prev_surviving_in]
+                    assert src_slice.shape == dst_weight[new_o].shape, (
+                        f"deep_model_copy_channelwise: layer {l} channel {old_o}->{new_o} "
+                        f"shape mismatch: source slice {tuple(src_slice.shape)} vs "
+                        f"destination {tuple(dst_weight[new_o].shape)}.")
                     dst_weight[new_o] = src_slice
                     if src_bias is not None and dst_bias is not None:
                         dst_bias[new_o] = src_bias[old_o]
@@ -187,6 +313,10 @@ def deep_model_copy_channelwise(source_model, destination_model, feature_list):
             elif layer_str.find('BatchNorm') != -1 and prev_surviving_in is not None:
                 src_bn = source_model.features[l]
                 dst_bn = destination_model.features[l]
+                assert len(prev_surviving_in) == dst_bn.weight.shape[0], (
+                    f"deep_model_copy_channelwise: BatchNorm layer {l} expects "
+                    f"{dst_bn.weight.shape[0]} channels but the preceding conv layer kept "
+                    f"{len(prev_surviving_in)} -- feature_list bookkeeping has diverged.")
                 for new_o, old_o in enumerate(prev_surviving_in):
                     dst_bn.weight[new_o] = src_bn.weight[old_o]
                     dst_bn.bias[new_o] = src_bn.bias[old_o]

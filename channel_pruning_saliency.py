@@ -15,13 +15,11 @@ import os
 from datetime import date
 
 import torch
-import torch.nn.utils.prune as prune
 
 import facilitate_pruning as fp
-import initialize_pruning as ip
 import load_dataset as dl
 import load_model as lm
-import train_model as tm
+import pruning_driver as pd
 
 # In[2]: Read configuration
 config = configparser.ConfigParser()
@@ -104,125 +102,17 @@ else:
                                   freeze_feature_arg=False, device_l=device1)
 
 
-# In[7]: Custom pruning method - zeroes whole output channels (structured
-# channel pruning), driven by an externally-supplied list of channel indices.
-# NOTE: the previous version of this class left the actual masking line
-# commented out and unconditionally `break`-ed out of its loop, so it never
-# pruned anything -- fine-tuning silently ran on the unpruned dense model.
-_channels_to_prune = []
-
-
-class ChannelPruningMask(prune.BasePruningMethod):
-    PRUNING_TYPE = 'unstructured'
-
-    def compute_mask(self, t, default_mask):
-        mask = default_mask.clone()
-        for ch in _channels_to_prune:
-            mask[ch] = 0
-        return mask
-
-
-def prune_channels(conv_module, name, channel_indices):
-    global _channels_to_prune
-    _channels_to_prune = channel_indices
-    ChannelPruningMask.apply(conv_module, name)
-    return conv_module
-
-
-# In[8]: Compute, for every conv layer inside a given block, the list of
-# output-channel indices that should be pruned.
-def compute_candidate_channels_for_block(score_fn, conv_modules, block_list_l, block_id, prune_count_l):
-    candidate_layers = []
-    end_index = 0
-    for bl, block_size in enumerate(block_list_l):
-        start_index = end_index
-        end_index = end_index + block_size
-        if bl != block_id:
-            continue
-        for lno in range(start_index, end_index):
-            weight = conv_modules[lno]._parameters['weight']
-            candidate_layers.append(score_fn(weight, prune_amount=prune_count_l[lno]))
-        break
-    return candidate_layers
-
-
-def layer_number_to_prune(block_id, j):
-    if block_id < 2:
-        return (block_id * 2) + j
-    return 4 + (block_id - 2) * 3 + j
-
-
-# In[9]: Update the feature list after a pruning round
-def update_feature_list(feature_list_l, prune_count_update, start=0, end=None):
-    if end is None:
-        end = len(prune_count_update)
-    j = 0
-    i = start
-    while j < end:
-        if feature_list_l[i] == 'M':
-            i += 1
-            continue
-        feature_list_l[i] = feature_list_l[i] - prune_count_update[j]
-        j += 1
-        i += 1
-    return feature_list_l
-
-
-# In[10]: Main iterative pruning loop
-def iterative_channel_pruning_saliency_block_wise(model, prune_rounds):
-    log("\nPruning Process Start")
-    global current_model
-
-    for e in range(prune_rounds):
-        block_list = ip.create_block_list(model)
-        conv_modules = ip.make_list_conv_param(model)
-        prune_count = ip.get_prune_count(module=conv_modules, blocks=block_list, max_pr=max_pruning_ratio)
-        feature_list = ip.create_feature_list(model)
-
-        for blk_id in range(len(block_list)):
-            candidates = compute_candidate_channels_for_block(
-                fp.compute_saliency_score_channel, conv_modules, block_list, blk_id, prune_count)
-            for j in range(block_list[blk_id]):
-                lno = layer_number_to_prune(blk_id, j)
-                prune_channels(conv_modules[lno], 'weight', candidates[j])
-
-        for conv_module in conv_modules:
-            prune.remove(module=conv_module, name='weight')
-
-        feature_list = update_feature_list(feature_list, prune_count)
-
-        temp_model = lm.create_vgg_from_feature_list(vgg_feature_list=feature_list, batch_norm=True)
-        temp_model.to(device1)
-
-        lm.freeze(temp_model)
-        fp.deep_model_copy_channelwise(model, temp_model, feature_list)
-        lm.unfreeze(temp_model)
-
-        log('\n ...Deep Copy Completed...')
-        log('\n Fine tuning started....')
-
-        tm.fit_one_cycle(dataloaders=dataLoaders,
-                         train_dir=dl.train_directory, test_dir=dl.test_directory,
-                         model_name='vgg16bn', model=temp_model, device_l=device1,
-                         epochs=fine_tune_epochs, max_lr=max_lr, weight_decay=weight_decay,
-                         L1=l1_lambda, grad_clip=grad_clip,
-                         opt_func=opt_func, log_file=logResultFile)
-
-        train_result = tm.evaluate(temp_model, dataLoaders[dl.train_directory])
-        test_result = tm.evaluate(temp_model, dataLoaders[dl.test_directory])
-
-        with open(outFile, 'a') as out_file:
-            out_file.write(f'\n output of the {e}th iteration is written below\n')
-            out_file.write(f'\n Train Accuracy: {train_result["val_acc"]}'
-                           f'\n Test Accuracy  : {test_result["val_acc"]} \n')
-
-        save_path = f'{model_dir}/vgg16_IntelIc_Prune_{e}_b_train'
-        torch.save(temp_model, save_path)
-
-        # Next round prunes and fine-tunes the model this round just produced.
-        model = temp_model
-        current_model = temp_model
+# In[7]: Bundle everything prune_one_round needs for every round of this run.
+round_kwargs = dict(
+    max_pruning_ratio=max_pruning_ratio, fine_tune_epochs=fine_tune_epochs,
+    max_lr=max_lr, weight_decay=weight_decay, l1_lambda=l1_lambda, grad_clip=grad_clip,
+    opt_func=opt_func, dataloaders=dataLoaders, train_dir=dl.train_directory,
+    test_dir=dl.test_directory, device=device1, model_name='vgg16bn',
+    log_fn=log, log_file=logResultFile, out_file=outFile, model_dir=model_dir,
+    save_prefix='vgg16_IntelIc_Prune',
+)
 
 
 if __name__ == '__main__':
-    iterative_channel_pruning_saliency_block_wise(current_model, prune_epochs)
+    current_model = pd.iterative_channel_pruning(
+        current_model, prune_epochs, fp.compute_saliency_score_channel, **round_kwargs)
