@@ -17,22 +17,49 @@ def compute_saliency_score_channel(tensor_t, n=1, prune_amount=1):
     return order[:prune_amount].tolist()
 
 
-# In[3]: Channel (filter) importance by redundancy criterion.
-# Normalizes every output channel to unit norm, computes pairwise distance
-# between channels, and returns the indices of the `prune_amount` channels
-# that are closest to some other channel in the layer (i.e. most redundant /
-# most "similar" to another surviving channel), most redundant first.
+# In[3]: Channel (filter) importance by redundancy criterion (thesis Ch. 5.1).
+# Normalizes every output channel to unit norm, repeatedly finds the closest
+# remaining pair of channels by normalized Lp distance, and marks the
+# smaller-(original-norm) member of that pair for pruning -- matching the
+# thesis's "prune the channel in the closest pair with the smaller original
+# norm" literally, generalized to `prune_amount` channels by repeating the
+# find-closest-pair step against only the channels not yet marked.
+#
+# This used to rank every channel by its own nearest-neighbor distance in a
+# single pass and take the `prune_amount` smallest -- which can mark BOTH
+# members of one very close pair when `prune_amount >= 2` (they have the
+# same nearest-neighbor distance: each other), discarding a redundant pair
+# entirely instead of keeping one representative and spending the freed-up
+# "prune slot" on the next most redundant channel elsewhere. It also never
+# actually used channel norm to break the tie between a close pair's two
+# members, despite that being the documented criterion -- ties fell to
+# whichever channel had the smaller original index instead.
 def compute_distance_score_channel(tensor_t, n=1, prune_amount=1):
     out_channels = tensor_t.shape[0]
     prune_amount = max(0, min(prune_amount, out_channels - 1))
+    if prune_amount == 0:
+        return []
+
     flat = tensor_t.reshape(out_channels, -1)
-    norms = torch.norm(flat, p=2, dim=1, keepdim=True).clamp_min(1e-12)
-    normalized = flat / norms
+    original_norm = torch.norm(flat, p=2, dim=1)
+    normalized = flat / original_norm.clamp_min(1e-12).unsqueeze(1)
     dist = torch.cdist(normalized, normalized, p=n)
     dist.fill_diagonal_(float('inf'))
-    nearest_dist, _ = torch.min(dist, dim=1)
-    order = torch.argsort(nearest_dist)
-    return order[:prune_amount].tolist()
+
+    alive = torch.ones(out_channels, dtype=torch.bool)
+    pruned = []
+    for _ in range(prune_amount):
+        alive_idx = alive.nonzero(as_tuple=True)[0]
+        sub_dist = dist[alive_idx][:, alive_idx]
+        flat_min_idx = torch.argmin(sub_dist).item()
+        i_local, j_local = divmod(flat_min_idx, sub_dist.shape[1])
+        i, j = alive_idx[i_local].item(), alive_idx[j_local].item()
+
+        drop = i if original_norm[i] <= original_norm[j] else j
+        pruned.append(drop)
+        alive[drop] = False
+
+    return pruned
 
 
 # In[3b]: Channel importance by "Max3" saliency criterion (thesis Ch. 4.3).
@@ -90,10 +117,43 @@ def _pairwise_distance(a, b, distance='manhattan'):
     raise ValueError(f"Unknown distance metric: {distance!r}")
 
 
+def _kmeans_plusplus_init(features, k, distance='manhattan'):
+    # Plain `features[randperm(n)[:k]]` picks k existing points as the
+    # starting centroids. A near-duplicate pair (near-zero distance apart)
+    # then very often gets chosen as two *separate* centroids -- and since
+    # each is at distance 0 from its own centroid, neither can ever be
+    # reassigned to the other's cluster, so the "redundant" pair survives
+    # pruning as two distinct clusters. This is worse, not better, when
+    # `k` is close to `n` (i.e. pruning a small fraction per round, which
+    # is the actual operating regime here: config.ini's max_pruning_ratio
+    # is spread thin across several rounds) -- most points end up being
+    # some initial centroid, so duplicate pairs split constantly.
+    #
+    # k-means++ fixes this by choosing each subsequent centroid randomly
+    # with probability proportional to its squared distance from the
+    # nearest already-chosen centroid, so a point sitting right next to an
+    # existing centroid (as a near-duplicate does) is very unlikely to be
+    # picked as another one.
+    n = features.shape[0]
+    first = torch.randint(0, n, (1,)).item()
+    centroids = features[first].unsqueeze(0).clone()
+
+    for _ in range(1, k):
+        nearest_dist, _ = _pairwise_distance(features, centroids, distance=distance).min(dim=1)
+        weights = nearest_dist.clamp_min(0) ** 2
+        if weights.sum() <= 0:
+            next_idx = torch.randint(0, n, (1,)).item()
+        else:
+            next_idx = torch.multinomial(weights, 1).item()
+        centroids = torch.cat([centroids, features[next_idx].unsqueeze(0)], dim=0)
+
+    return centroids
+
+
 def _kmeans_cluster_channels(features, k, distance='manhattan', iters=25):
     n = features.shape[0]
     k = max(1, min(k, n))
-    centroids = features[torch.randperm(n)[:k]].clone()
+    centroids = _kmeans_plusplus_init(features, k, distance=distance)
 
     assignments = torch.full((n,), -1, dtype=torch.long)
     for it in range(iters):
